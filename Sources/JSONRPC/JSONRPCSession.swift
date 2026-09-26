@@ -112,6 +112,16 @@ public actor JSONRPCSession {
 
 		self.responders.removeAll()
 		channelClosed = true
+
+		eventContinuation.finish()
+	}
+
+	private func cancelRequest(_ key: String) {
+		guard let responder = responders.removeValue(forKey: key) else {
+			return
+		}
+
+		responder(.failure(CancellationError()))
 	}
 
 	private func startMonitoringChannel() {
@@ -172,13 +182,11 @@ public actor JSONRPCSession {
 	private func dispatchResponse(_ message: AnyJSONRPCResponse, originalData data: Data) throws {
 		let key = message.id.description
 
-		guard let responder = responders[key] else {
+		guard let responder = responders.removeValue(forKey: key) else {
 			throw ProtocolTransportError.unexpectedResponse(data)
 		}
 
 		responder(.success((message, data)))
-
-		responders[key] = nil
 	}
 }
 
@@ -189,17 +197,25 @@ extension JSONRPCSession {
 			throw ProtocolTransportError.dataStreamClosed
 		}
 
-		return try await withCheckedThrowingContinuation({ continuation in
-			// make sure not to capture self
-			self.sendDataRequest(params, method: method) { [weak self] result in
-				guard self != nil else {
-					continuation.resume(throwing: ProtocolTransportError.abandonedRequest)
-					return
-				}
+		try Task.checkCancellation()
 
-				continuation.resume(with: result)
-			}
-		})
+		let issuedId = generateID()
+
+		return try await withTaskCancellationHandler {
+			try await withCheckedThrowingContinuation({ continuation in
+				// make sure not to capture self
+				self.sendDataRequest(params, method: method, id: issuedId) { [weak self] result in
+					guard self != nil else {
+						continuation.resume(throwing: ProtocolTransportError.abandonedRequest)
+						return
+					}
+
+					continuation.resume(with: result)
+				}
+			})
+		} onCancel: {
+			Task { await self.cancelRequest(issuedId.description) }
+		}
 	}
 
 	public func sendRequest<Request, Response>(_ params: Request, method: String) async throws -> JSONRPCResponse<Response>
@@ -244,11 +260,9 @@ extension JSONRPCSession {
 
 extension JSONRPCSession {
 	private func sendDataRequest<Request>(
-		_ params: Request, method: String,
+		_ params: Request, method: String, id issuedId: JSONId,
 		responseHandler: @escaping MessageResponder
 	) where Request: Encodable {
-		let issuedId = generateID()
-
 		let request = JSONRPCRequest(id: issuedId, method: method, params: params)
 
 		// make sure to store the responser *first*, before sending the message. This prevents a race where the response comes in so fast we aren't yet waiting for it
@@ -262,10 +276,8 @@ extension JSONRPCSession {
 			do {
 				try await encodeAndWrite(request)
 			} catch {
-				responseHandler(.failure(error))
-
-				self.responders[key] = nil
-				return
+				// the responder may have already been resolved, by the channel closing or cancellation
+				self.responders.removeValue(forKey: key)?(.failure(error))
 			}
 		}
 	}

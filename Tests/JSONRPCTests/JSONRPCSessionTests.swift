@@ -152,6 +152,72 @@ final class JSONRPCSessionTests: XCTestCase {
 
 		XCTAssertNil(try response.content.get())
 	}
+
+	func testCancelledRequestThrowsCancellationError() async throws {
+		let pair = DataChannel.DataSequence.makeStream()
+		let written = XCTestExpectation(description: "Request written")
+		let channel = DataChannel(writeHandler: { _ in written.fulfill() }, dataSequence: pair.stream)
+		let session = JSONRPCSession(channel: channel)
+
+		let task = Task {
+			let _: TestResponse = try await session.sendRequest("hello", method: "myrequest")
+		}
+
+		await fulfillment(of: [written], timeout: 1.0)
+		task.cancel()
+
+		do {
+			try await task.value
+			XCTFail("expected cancellation")
+		} catch {
+			XCTAssertTrue(error is CancellationError)
+		}
+	}
+
+	func testChannelCloseDuringWrite() async throws {
+		struct WriteError: Error {}
+
+		let pair = DataChannel.DataSequence.makeStream()
+		let gate = AsyncStream<Void>.makeStream()
+		let written = XCTestExpectation(description: "Request written")
+		let eventsFinished = XCTestExpectation(description: "Event sequence finished")
+
+		let channel = DataChannel(
+			writeHandler: { _ in
+				written.fulfill()
+				for await _ in gate.stream {}
+				throw WriteError()
+			},
+			dataSequence: pair.stream
+		)
+		let session = JSONRPCSession(channel: channel)
+
+		Task {
+			for await _ in await session.eventSequence {}
+			eventsFinished.fulfill()
+		}
+
+		let task = Task {
+			let _: TestResponse = try await session.sendRequest("hello", method: "myrequest")
+		}
+
+		// the server goes away while the request is being written
+		await fulfillment(of: [written], timeout: 1.0)
+		pair.continuation.finish()
+
+		do {
+			try await task.value
+			XCTFail("expected failure")
+		} catch {
+			XCTAssertFalse(error is WriteError)
+		}
+
+		await fulfillment(of: [eventsFinished], timeout: 1.0)
+
+		// then the write fails too, after the request was already resolved
+		gate.continuation.finish()
+		try await Task.sleep(nanoseconds: 100_000_000)
+	}
 }
 
 #endif
