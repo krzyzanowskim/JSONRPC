@@ -1,7 +1,7 @@
 import Foundation
 
-enum ProtocolTransportError: Error {
-	case undecodableMesssage(Data)
+public enum ProtocolTransportError: Error {
+	case undecodableMessage(Data)
 	case unexpectedResponse(Data)
 	case abandonedRequest
 	case dataStreamClosed
@@ -43,16 +43,24 @@ public enum JSONRPCEvent: Sendable {
 	case error(Error)
 }
 
+/// A message waiting for the writer task, with a handler called once the write finished or failed.
+private struct PendingWrite: Sendable {
+	let data: Data
+	let completion: @Sendable (Error?) -> Void
+}
+
 public actor JSONRPCSession {
 	public typealias EventSequence = AsyncStream<JSONRPCEvent>
 	public typealias DataResult = Result<(AnyJSONRPCResponse, Data), Error>
 	private typealias MessageResponder = @Sendable (DataResult) -> Void
+	private typealias WriteSequence = AsyncStream<PendingWrite>
 
 	private var id: Int
 	private let decoder = JSONDecoder()
 	private let encoder = JSONEncoder()
 	private let channel: DataChannel
 	private var readTask: Task<Void, Never>?
+	private let writeContinuation: WriteSequence.Continuation
 	private let eventContinuation: EventSequence.Continuation
 	private var responders = [String: MessageResponder]()
 	private var channelClosed = false
@@ -73,6 +81,24 @@ public actor JSONRPCSession {
 		self.eventContinuation = escapedEventContinuation!
 //#endif
 
+		// All writes go through one task, in the order they were enqueued on the actor.
+		// Writing from separate tasks would let a later message overtake an earlier one,
+		// and let concurrent writes interleave on the channel.
+		let (writeSequence, writeContinuation) = WriteSequence.makeStream()
+		let writeHandler = channel.writeHandler
+
+		self.writeContinuation = writeContinuation
+		Task {
+			for await pendingWrite in writeSequence {
+				do {
+					try await writeHandler(pendingWrite.data)
+					pendingWrite.completion(nil)
+				} catch {
+					pendingWrite.completion(error)
+				}
+			}
+		}
+
 		Task {
 			await startMonitoringChannel()
 		}
@@ -80,6 +106,8 @@ public actor JSONRPCSession {
 
 	deinit {
 		eventContinuation.finish()
+		// lets already queued writes drain, then ends the writer task
+		writeContinuation.finish()
 		readTask?.cancel()
 
 		for (_, responder) in responders {
@@ -95,14 +123,42 @@ public actor JSONRPCSession {
 		return issuedId
 	}
 
-	private func encodeAndWrite<T>(_ value: T) async throws where T: Encodable {
+	/// Encodes `value` and queues it for writing. The write position is fixed when this is called.
+	private func enqueueWrite<T>(_ value: T, completion: @escaping @Sendable (Error?) -> Void) where T: Encodable {
 		if channelClosed {
-			throw ProtocolTransportError.dataStreamClosed
+			completion(ProtocolTransportError.dataStreamClosed)
+			return
 		}
-		
-		let data = try encoder.encode(value)
 
-		try await channel.writeHandler(data)
+		let data: Data
+
+		do {
+			data = try encoder.encode(value)
+		} catch {
+			completion(error)
+			return
+		}
+
+		if case .terminated = writeContinuation.yield(PendingWrite(data: data, completion: completion)) {
+			completion(ProtocolTransportError.dataStreamClosed)
+		}
+	}
+
+	private func encodeAndWrite<T>(_ value: T) async throws where T: Encodable {
+		try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+			enqueueWrite(value) { error in
+				if let error {
+					continuation.resume(throwing: error)
+				} else {
+					continuation.resume()
+				}
+			}
+		}
+	}
+
+	private func requestWriteFailed(key: String, error: Error) {
+		// the responder may have already been resolved, by the channel closing or cancellation
+		responders.removeValue(forKey: key)?(.failure(error))
 	}
 
 	private func readSequenceFinished() {
@@ -272,13 +328,10 @@ extension JSONRPCSession {
 
 		self.responders[key] = responseHandler
 
-		Task {
-			do {
-				try await encodeAndWrite(request)
-			} catch {
-				// the responder may have already been resolved, by the channel closing or cancellation
-				self.responders.removeValue(forKey: key)?(.failure(error))
-			}
+		enqueueWrite(request) { [weak self] error in
+			guard let error else { return }
+
+			Task { await self?.requestWriteFailed(key: key, error: error) }
 		}
 	}
 }

@@ -68,6 +68,11 @@ The closures on the `DataChannel` allow different transport mechanisms to be use
 - WebSocket channel
   - Uses `URLSessionWebSocketTask` as a message transport.
   - Usage: `let channel = DataChannel.webSocket(url: socketURL, terminationHandler: { print("socket closed" })`
+- Newline framing
+  - Wraps a byte-stream channel (for example a child process's pipes) so each message is one line of JSON, as used by the Agent Client Protocol, MCP stdio and Codex app-server. Non-JSON lines are skipped.
+  - Usage: `let framed = rawChannel.withNewlineFraming(onSkippedLine: { print("skipped:", $0) })`
+
+`JSONRPCSession` writes every outgoing message (requests, notifications and replies) through a single writer, in the order the calls reach the session, so a notification sent after a request never reaches the wire first.
 
 ## Contributing and Collaboration
 
