@@ -4,38 +4,34 @@ import JSONRPC
 #if compiler(>=5.9)
 
 final class JSONRPCSessionWriteTests: XCTestCase {
-	private func sleep(milliseconds: UInt64) async throws {
-		try await Task.sleep(nanoseconds: milliseconds * 1_000_000)
-	}
+	private struct WriteFailed: Error {}
 
-	/// A request must reach the wire before a notification that is sent after it.
+	/// Messages are written in the order the calls reach the session.
 	///
-	/// The session actor is kept busy decoding a large inbound message, so the request call is
-	/// provably queued on the actor ahead of the notification.
+	/// A notification whose encoding blocks keeps the session busy, so the request and the
+	/// notification calls both queue up behind it, in that order.
 	func testRequestIsWrittenBeforeLaterNotification() async throws {
-		let busyMessage = try JSONEncoder().encode(
-			JSONRPCNotification(method: "busy", params: String(repeating: "x", count: 64 << 20))
-		)
+		let writes = Recorder()
+		let gate = EncodingGate()
+		let pair = DataChannel.DataSequence.makeStream()
+		let session = JSONRPCSession(channel: DataChannel(writeHandler: { writes.append($0) }, dataSequence: pair.stream))
 
-		for iteration in 0..<5 {
-			let log = WriteLog()
-			let pair = DataChannel.DataSequence.makeStream()
-			let session = JSONRPCSession(channel: DataChannel(writeHandler: { log.append($0) }, dataSequence: pair.stream))
+		let blocker = Task { try await session.sendNotification(gate, method: "blocker") }
+		try await gate.waitUntilEncoding()
 
-			try await sleep(milliseconds: 5)
-			pair.continuation.yield(busyMessage)
-			try await sleep(milliseconds: 5)
+		let request = Task { _ = try? await session.sendDataRequest("first", method: "request") }
+		try await Task.sleep(nanoseconds: 50_000_000)
+		let notification = Task { try await session.sendNotification("second", method: "notification") }
+		try await Task.sleep(nanoseconds: 50_000_000)
 
-			let request = Task { _ = try? await session.sendDataRequest("first", method: "request") }
-			try await sleep(milliseconds: 10)
-			try await session.sendNotification("second", method: "notification")
+		gate.open()
+		try await blocker.value
+		try await notification.value
 
-			let methods = try await log.waitForMethods(count: 2)
-			XCTAssertEqual(methods, ["request", "notification"], "iteration \(iteration)")
+		let methods = try await writes.waitForMethods(count: 3)
+		XCTAssertEqual(methods, ["blocker", "request", "notification"])
 
-			request.cancel()
-			pair.continuation.finish()
-		}
+		request.cancel()
 	}
 
 	func testWritesAreSerialized() async throws {
@@ -63,8 +59,6 @@ final class JSONRPCSessionWriteTests: XCTestCase {
 	}
 
 	func testNotificationWriteErrorIsThrown() async throws {
-		struct WriteFailed: Error {}
-
 		let pair = DataChannel.DataSequence.makeStream()
 		let session = JSONRPCSession(channel: DataChannel(writeHandler: { _ in throw WriteFailed() }, dataSequence: pair.stream))
 
@@ -76,8 +70,6 @@ final class JSONRPCSessionWriteTests: XCTestCase {
 	}
 
 	func testRequestWriteErrorFailsRequest() async throws {
-		struct WriteFailed: Error {}
-
 		let pair = DataChannel.DataSequence.makeStream()
 		let session = JSONRPCSession(channel: DataChannel(writeHandler: { _ in throw WriteFailed() }, dataSequence: pair.stream))
 
@@ -105,34 +97,29 @@ final class JSONRPCSessionWriteTests: XCTestCase {
 	}
 }
 
-private final class WriteLog: @unchecked Sendable {
+/// Encodes as a string, but blocks the encoding thread until `open()` is called, or for at most 5 seconds
+/// so a broken test fails instead of hanging.
+private final class EncodingGate: Encodable, @unchecked Sendable {
 	private let lock = NSLock()
-	private var items = [Data]()
+	private var started = false
+	private let gate = DispatchSemaphore(value: 0)
 
-	func append(_ data: Data) {
-		lock.lock()
-		items.append(data)
-		lock.unlock()
+	func encode(to encoder: Encoder) throws {
+		lock.withLock { started = true }
+		_ = gate.wait(timeout: .now() + 5)
+
+		var container = encoder.singleValueContainer()
+		try container.encode("gate")
 	}
 
-	func waitForMethods(count: Int, timeout: TimeInterval = 5) async throws -> [String] {
-		let deadline = Date().addingTimeInterval(timeout)
-
-		while Date() < deadline {
-			let snapshot = lock.withLock { items }
-
-			if snapshot.count >= count {
-				return try snapshot.map { data in
-					let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-					return object?["method"] as? String ?? ""
-				}
-			}
-
-			try await Task.sleep(nanoseconds: 5_000_000)
+	func waitUntilEncoding() async throws {
+		while !lock.withLock({ started }) {
+			try await Task.sleep(nanoseconds: 1_000_000)
 		}
+	}
 
-		XCTFail("timed out waiting for \(count) writes")
-		return []
+	func open() {
+		gate.signal()
 	}
 }
 
@@ -146,17 +133,17 @@ private final class ConcurrencyTracker: @unchecked Sendable {
 	var completed: Int { lock.withLock { _completed } }
 
 	func begin() {
-		lock.lock()
-		inFlight += 1
-		_maxInFlight = max(_maxInFlight, inFlight)
-		lock.unlock()
+		lock.withLock {
+			inFlight += 1
+			_maxInFlight = max(_maxInFlight, inFlight)
+		}
 	}
 
 	func end() {
-		lock.lock()
-		inFlight -= 1
-		_completed += 1
-		lock.unlock()
+		lock.withLock {
+			inFlight -= 1
+			_completed += 1
+		}
 	}
 }
 

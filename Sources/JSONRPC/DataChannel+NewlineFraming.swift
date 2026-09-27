@@ -11,7 +11,8 @@ extension DataChannel {
 	///   `Data` per line. Blank lines and lines that do not start with `{` or `[`
 	///   (stray log output on stdout) are passed to `onSkippedLine` and dropped.
 	///   A final unterminated line is flushed when the upstream sequence ends.
-	///   A line longer than `maxLineLength` is dropped; its first 256 bytes are passed to `onSkippedLine`.
+	///   A line longer than `maxLineLength` bytes is dropped, and its first 256 bytes
+	///   are passed to `onSkippedLine`, however the input was chunked.
 	public func withNewlineFraming(
 		maxLineLength: Int = 256 << 20,
 		onSkippedLine: (@Sendable (Data) -> Void)? = nil
@@ -27,12 +28,24 @@ extension DataChannel {
 
 		let (stream, continuation) = DataSequence.makeStream()
 
+		// Only the first `reportLength` bytes of an overlong line are reported, so a partial line
+		// is kept until it is longer than both limits, then the rest of it is discarded.
+		let reportLength = 256
+		let discardThreshold = max(maxLineLength, reportLength)
+
 		let reader = Task {
 			var buffer = Data()
 			var scanned = 0 // bytes of `buffer` already known to contain no newline
+			var discarding = false // dropping the rest of an overlong line that was already reported
 
-			func emit(_ line: Data) {
-				var line = line
+			/// Yields or skips one complete line, copying only the bytes that are passed on.
+			func handleLine(_ bytes: UnsafeRawBufferPointer) {
+				if bytes.count > maxLineLength {
+					onSkippedLine?(Data(bytes.prefix(reportLength)))
+					return
+				}
+
+				var line = Data(bytes)
 				if line.last == 0x0D {
 					line.removeLast()
 				}
@@ -57,7 +70,12 @@ extension DataChannel {
 					while scanned < raw.count, let hit = memchr(base + scanned, 0x0A, raw.count - scanned) {
 						let newline = base.distance(to: UnsafeRawPointer(hit))
 
-						emit(Data(bytes: base + lineStart, count: newline - lineStart))
+						if discarding {
+							discarding = false
+						} else {
+							handleLine(UnsafeRawBufferPointer(rebasing: raw[lineStart..<newline]))
+						}
+
 						lineStart = newline + 1
 						scanned = lineStart
 					}
@@ -69,15 +87,19 @@ extension DataChannel {
 
 				scanned = buffer.count
 
-				if buffer.count > maxLineLength {
-					onSkippedLine?(buffer.prefix(256))
+				if !discarding && buffer.count > discardThreshold {
+					onSkippedLine?(buffer.prefix(reportLength))
+					discarding = true
+				}
+
+				if discarding {
 					buffer.removeAll(keepingCapacity: false)
 					scanned = 0
 				}
 			}
 
-			if !buffer.isEmpty {
-				emit(buffer)
+			if !discarding && !buffer.isEmpty {
+				buffer.withUnsafeBytes(handleLine)
 			}
 
 			continuation.finish()
